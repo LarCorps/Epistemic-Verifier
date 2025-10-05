@@ -1,44 +1,108 @@
+# webapp.py
+import os
+import tempfile
+from enum import Enum
 
-import os, json
 from flask import Flask, request, jsonify
+from werkzeug.utils import secure_filename
+
 from .verifier import verify_path
+from .result import VerifyOutcome, VerifyResult
+from .hashing import sha256_file
 
 app = Flask(__name__)
 
-@app.get('/')
+# ---------- JSON safety helpers ----------
+
+def _json_safe(obj):
+    """Recursively convert result objects (bytes/enums/etc.) to JSON-serializable values."""
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Enum):
+        # dataclasses like VerifyOutcome inherit from Enum
+        return obj.value if hasattr(obj, "value") else obj.name
+    if isinstance(obj, bytes):
+        # hex is human-friendly for manifests & hashes
+        return obj.hex()
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(x) for x in obj]
+    # Fallback best-effort
+    return str(obj)
+
+# ---------- Routes ----------
+
+@app.get("/")
 def index():
     return INDEX_HTML
 
-@app.post('/verify')
+@app.post("/verify")
 def verify():
-    if 'file' not in request.files:
-        return jsonify({'error': 'no file'}), 400
-    f = request.files['file']
-    tmp_path = os.path.join('/tmp', f.filename)
-    f.save(tmp_path)
-    res = verify_path(tmp_path, details=True)
+    if "file" not in request.files:
+        return jsonify({"error": "no file part"}), 400
+
+    f = request.files["file"]
+    if not f or not f.filename:
+        return jsonify({"error": "no filename"}), 400
+
+    # Cross-platform safe temp file (works on Windows/macOS/Linux)
+    safe_name = secure_filename(f.filename) or "upload.bin"
+    suffix = os.path.splitext(safe_name)[1]
+    fd, tmp_path = tempfile.mkstemp(prefix="atvx_", suffix=suffix)
+    os.close(fd)
+
     try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
-    return jsonify({
-        'outcome': res.outcome,
-        'reason': res.reason,
-        'tier': res.tier,
-        'file_sha256': res.file_sha256,
-        'chain_status': res.chain_status,
-        'signature_status': res.signature_status,
-        'watermark_status': res.watermark_status,
-        'attestation_status': res.attestation_status,
-        'details': res.details,
-        'manifest': res.manifest,
-    })
+        f.save(tmp_path)
+
+        # Always respond with JSON; never let exceptions bubble to 500
+        try:
+            res = verify_path(tmp_path, details=True)
+        except Exception as e:
+            # Provide a minimal struct for the UI even on verifier errors
+            file_hash = None
+            try:
+                file_hash = sha256_file(tmp_path)
+            except Exception:
+                pass
+            res = VerifyResult(
+                outcome=VerifyOutcome.UNVERIFIED,
+                reason=f"Verifier error: {e}",
+                tier="FAILED",
+                file_sha256=file_hash,
+            )
+
+        payload = {
+            "outcome": _json_safe(res.outcome),
+            "reason": _json_safe(res.reason),
+            "tier": _json_safe(res.tier),
+            "file_sha256": _json_safe(res.file_sha256),
+            "chain_status": _json_safe(res.chain_status),
+            "signature_status": _json_safe(res.signature_status),
+            "watermark_status": _json_safe(res.watermark_status),
+            "attestation_status": _json_safe(res.attestation_status),
+            "details": _json_safe(res.details),
+            "manifest": _json_safe(res.manifest),
+        }
+        return jsonify(payload)
+
+    finally:
+        # Clean up temp file regardless of outcome
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+# ---------- UI ----------
 
 INDEX_HTML = """<!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-<meta charset=\"utf-8\">
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Epistemic Verifier</title>
 <style>
   html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
@@ -57,16 +121,16 @@ INDEX_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-<div class=\"wrap\">
-  <div class=\"card\">
+<div class="wrap">
+  <div class="card">
     <h1>Epistemic Verifier</h1>
-    <div id=\"drop\" class=\"drop\">
+    <div id="drop" class="drop">
       <p><strong>Drag & drop</strong> a JPEG or MP4 here</p>
-      <input id=\"file\" type=\"file\" accept=\"image/jpeg,video/mp4\" style=\"display:none\" />
-      <div class=\"btn\" onclick=\"document.getElementById('file').click()\">Select file</div>
+      <input id="file" type="file" accept="image/jpeg,video/mp4" style="display:none" />
+      <div class="btn" onclick="document.getElementById('file').click()">Select file</div>
     </div>
-    <div id=\"status\"></div>
-    <pre id=\"out\" style=\"display:none\"></pre>
+    <div id="status"></div>
+    <pre id="out" style="display:none"></pre>
   </div>
 </div>
 <script>
@@ -85,9 +149,13 @@ function show(res){
 async function send(file){
   const fd = new FormData();
   fd.append('file', file, file.name);
-  const r = await fetch('/verify', { method: 'POST', body: fd });
-  const j = await r.json();
-  show(j);
+  try {
+    const r = await fetch('/verify', { method: 'POST', body: fd });
+    const j = await r.json();
+    show(j);
+  } catch (e) {
+    show({ outcome:'UNVERIFIED', reason: 'Network/parse error' });
+  }
 }
 
 ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); }));
@@ -104,5 +172,5 @@ file.addEventListener('change', e => {
 </body>
 </html>"""
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
