@@ -1,4 +1,3 @@
-# verifier.py
 from typing import Optional, Dict, Any, Tuple, List, Set
 import struct
 import io
@@ -323,9 +322,45 @@ def recompute_chunk_hashes_bytes_path(path: str, chunk_size: int) -> List[str]:
 
 # ---------------- COSE / Attestation helpers ----------------
 
+def _decode_protected_map(m: Any) -> Dict[str, Any]:
+    if isinstance(m, (bytes, bytearray)):
+        try:
+            return cbor2.loads(m)
+        except Exception:
+            return {}
+    return m if isinstance(m, dict) else {}
+
+def _cose_headers(cose: Dict[str, Any]) -> Tuple[Optional[int], Optional[bytes], Dict[str, Any]]:
+    """
+    Returns (alg, kid_bytes, protected_map).
+    ES256 is alg = -7. 'kid' may be bytes or hex/utf-8 string.
+    """
+    prot = _decode_protected_map(cose.get("protected") or {})
+    # COSE label 1 == alg; 4 == kid
+    alg = prot.get(1, prot.get("alg"))
+    kid = prot.get(4, prot.get("kid"))
+    if isinstance(kid, str):
+        try:
+            kid = binascii.unhexlify(kid.strip())
+        except Exception:
+            kid = kid.encode("utf-8")
+    return (int(alg) if isinstance(alg, int) else None,
+            bytes(kid) if isinstance(kid, (bytes, bytearray)) else None,
+            prot)
+
+def _ensure_es256(alg: Optional[int]) -> Tuple[bool, str]:
+    """
+    Enforce ES256 (COSE alg = -7).
+    Non-ES256 is marked UNVERIFIED (policy parity with Android).
+    """
+    if alg == -7:
+        return True, "ES256"
+    return False, f"Unsupported COSE alg={alg}; expect ES256 (-7)"
+
 try:
     from cryptography import x509
     from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 except Exception:  # pragma: no cover
     x509 = None
 
@@ -381,11 +416,38 @@ def _leaf_pubkey_pem_from_chain(chain_items: Any) -> Optional[bytes]:
     except Exception:
         return None
 
+def _spki_der_from_pem_or_der(pub_bytes: bytes) -> Optional[bytes]:
+    """
+    Convert SPKI in PEM or DER to DER bytes for SHA-256 digest.
+    """
+    if not pub_bytes:
+        return None
+    if pub_bytes.startswith(b"-----BEGIN"):
+        # strip PEM armor
+        try:
+            body = b"".join(
+                ln for ln in pub_bytes.splitlines() if b"-----" not in ln and ln.strip()
+            )
+            import base64
+            return base64.b64decode(body)
+        except Exception:
+            return None
+    return pub_bytes
+
 def _verify_cose_with_attestation(cose: Dict[str, Any], manifest_map: Dict[str, Any]) -> Tuple[str, str]:
     """
-    Try to verify COSE using an attested leaf key. Supports both video-style and photo-style fields.
+    Verify COSE using an attested leaf key (video: attestation_chain/attestation.chain,
+    photo: trust.cert_chain_der). Enforces ES256 and key-identity binding:
+    - signer_key_id == SHA-256(SPKI)
+    - if present, COSE kid is a prefix of SHA-256(SPKI)
     Returns (signature_status, reason).
     """
+    # Enforce ES256
+    alg, kid, _prot = _cose_headers(cose)
+    ok_alg, alg_reason = _ensure_es256(alg)
+    if not ok_alg:
+        return ("UNVERIFIED", alg_reason)
+
     # Video-style: top-level attestation_chain / attestation.chain
     att_chain = (manifest_map.get("attestation_chain")
                  or (manifest_map.get("attestation") or {}).get("chain"))
@@ -399,10 +461,36 @@ def _verify_cose_with_attestation(cose: Dict[str, Any], manifest_map: Dict[str, 
             if pem_or_der:
                 try:
                     ok = verify_cose_sign1(cose, pem_or_der)
-                    return ("PASS" if ok else "FAIL",
-                            "Verified with leaf key from attestation chain")
+                    if not ok:
+                        return ("FAIL", "COSE signature invalid for attested leaf key")
+
+                    # Key identity binding checks
+                    spki_der = _spki_der_from_pem_or_der(pem_or_der)
+                    if not spki_der:
+                        return ("UNVERIFIED", "Could not decode SPKI from attestation leaf")
+                    spki_sha256 = hashlib.sha256(spki_der).digest()
+
+                    signer_key_id = manifest_map.get("signer_key_id")
+                    if signer_key_id is None:
+                        return ("UNVERIFIED", "Manifest missing signer_key_id")
+                    if isinstance(signer_key_id, str):
+                        try:
+                            signer_key_id = binascii.unhexlify(signer_key_id.strip())
+                        except Exception:
+                            signer_key_id = signer_key_id.encode("utf-8")
+                    if not isinstance(signer_key_id, (bytes, bytearray)):
+                        return ("UNVERIFIED", "Malformed signer_key_id")
+
+                    if bytes(signer_key_id) != spki_sha256:
+                        return ("FAIL", "signer_key_id != SHA-256(SPKI of attested leaf)")
+
+                    if kid is not None:
+                        if len(kid) > len(spki_sha256) or kid != spki_sha256[: len(kid)]:
+                            return ("FAIL", "COSE kid is not a prefix of SHA-256(SPKI)")
+
+                    return ("PASS", "COSE verified with attested leaf; key binding OK")
                 except Exception as e:
-                    return ("FAIL", f"COSE verify with attestation leaf failed: {e}")
+                    return ("FAIL", f"COSE/attestation check failed: {e}")
 
     return ("UNVERIFIED", "No usable attestation leaf; COSE not verified")
 
@@ -413,6 +501,7 @@ def verify_path(path: str, *, details: bool = False, public_key_pem: Optional[by
     Full verifier:
       - extract manifest (COSE or CBOR),
       - if COSE: verify using supplied public key OR attestation leaf key (video: attestation_chain; photo: trust.cert_chain_der),
+      - enforce ES256 and key binding (signer_key_id + kid prefix),
       - recompute chunk chain (frames/bytes) from the actual file when present (videos),
       - map tier (SILVER when attested TEE + valid COSE; for photos use trust.tier if present),
       - watermark checks are deprecated (watermark_status is fixed to 'UNVERIFIED').
@@ -432,16 +521,45 @@ def verify_path(path: str, *, details: bool = False, public_key_pem: Optional[by
     sig_status = "UNVERIFIED"
     sig_reason = None
     if man["format"] == "cose_sign1":
-        if public_key_pem:
-            try:
-                ok = verify_cose_sign1(cose, public_key_pem)
-                sig_status = "PASS" if ok else "FAIL"
-                sig_reason = "Verified with provided public key"
-            except Exception as e:
-                sig_status = "FAIL"
-                sig_reason = f"COSE verify with provided key failed: {e}"
+        # Always enforce ES256 first
+        alg, kid, _ = _cose_headers(cose)
+        ok_alg, alg_reason = _ensure_es256(alg)
+        if not ok_alg:
+            sig_status, sig_reason = ("UNVERIFIED", alg_reason)
         else:
-            sig_status, sig_reason = _verify_cose_with_attestation(cose, payload_map)
+            if public_key_pem:
+                # Verify signature; also enforce key binding if manifest provides signer_key_id
+                try:
+                    ok = verify_cose_sign1(cose, public_key_pem)
+                    if not ok:
+                        sig_status, sig_reason = ("FAIL", "COSE verify failed with provided public key")
+                    else:
+                        spki_der = _spki_der_from_pem_or_der(public_key_pem)
+                        if spki_der and isinstance(payload_map, dict) and payload_map.get("signer_key_id") is not None:
+                            spki_sha256 = hashlib.sha256(spki_der).digest()
+                            signer_key_id = payload_map.get("signer_key_id")
+                            if isinstance(signer_key_id, str):
+                                try:
+                                    signer_key_id = binascii.unhexlify(signer_key_id.strip())
+                                except Exception:
+                                    signer_key_id = signer_key_id.encode("utf-8")
+                            if not isinstance(signer_key_id, (bytes, bytearray)):
+                                sig_status, sig_reason = ("UNVERIFIED", "Malformed signer_key_id")
+                            elif bytes(signer_key_id) != spki_sha256:
+                                sig_status, sig_reason = ("FAIL", "signer_key_id != SHA-256(SPKI of provided key)")
+                            else:
+                                # Optional: kid prefix check if kid present
+                                if kid is not None and bytes(kid) != spki_sha256[: len(kid)]:
+                                    sig_status, sig_reason = ("FAIL", "COSE kid is not a prefix of SHA-256(SPKI)")
+                                else:
+                                    sig_status, sig_reason = ("PASS", "COSE verified with provided key; key binding OK")
+                        else:
+                            sig_status, sig_reason = ("PASS", "COSE verified with provided public key")
+                except Exception as e:
+                    sig_status, sig_reason = ("FAIL", f"COSE verify with provided key failed: {e}")
+            else:
+                # Attestation path does both signature + key binding checks
+                sig_status, sig_reason = _verify_cose_with_attestation(cose, payload_map)
 
     # ---- Pin check
     # Video-style whole-file pins we can recompute; photo-style content pin (integrity.content_sha256) is informational.
