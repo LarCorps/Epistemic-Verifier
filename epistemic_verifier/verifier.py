@@ -9,7 +9,7 @@ import cbor2
 
 from .result import VerifyOutcome, VerifyResult
 from .hashing import sha256_file
-from .jpeg_parser import find_app11_atvx
+from .jpeg_parser import find_app11_atvx, hash_jpeg_himg
 from .mp4_parser import find_uuid_atvx
 from .cbor_cose import parse_cose_sign1, verify_cose_sign1
 # Watermark deprecated: do not import or check
@@ -438,7 +438,7 @@ def _verify_cose_with_attestation(cose: Dict[str, Any], manifest_map: Dict[str, 
     """
     Verify COSE using an attested leaf key (video: attestation_chain/attestation.chain,
     photo: trust.cert_chain_der). Enforces ES256 and key-identity binding:
-    - signer_key_id == SHA-256(SPKI)
+    - signer_key_id == SHA-256(SPKI)  [REQUIRED for video; OPTIONAL for photo MVP]
     - if present, COSE kid is a prefix of SHA-256(SPKI)
     Returns (signature_status, reason).
     """
@@ -447,6 +447,11 @@ def _verify_cose_with_attestation(cose: Dict[str, Any], manifest_map: Dict[str, 
     ok_alg, alg_reason = _ensure_es256(alg)
     if not ok_alg:
         return ("UNVERIFIED", alg_reason)
+
+    # Does this manifest describe a photo?
+    is_photo = (isinstance(manifest_map, dict)
+                and isinstance(manifest_map.get("schema"), dict)
+                and (manifest_map["schema"].get("name") == "capture.photo"))
 
     # Video-style: top-level attestation_chain / attestation.chain
     att_chain = (manifest_map.get("attestation_chain")
@@ -471,24 +476,26 @@ def _verify_cose_with_attestation(cose: Dict[str, Any], manifest_map: Dict[str, 
                     spki_sha256 = hashlib.sha256(spki_der).digest()
 
                     signer_key_id = manifest_map.get("signer_key_id")
-                    if signer_key_id is None:
+                    # For photos, signer_key_id is OPTIONAL for MVP; for videos it's REQUIRED.
+                    if signer_key_id is None and not is_photo:
                         return ("UNVERIFIED", "Manifest missing signer_key_id")
                     if isinstance(signer_key_id, str):
                         try:
                             signer_key_id = binascii.unhexlify(signer_key_id.strip())
                         except Exception:
                             signer_key_id = signer_key_id.encode("utf-8")
-                    if not isinstance(signer_key_id, (bytes, bytearray)):
-                        return ("UNVERIFIED", "Malformed signer_key_id")
-
-                    if bytes(signer_key_id) != spki_sha256:
-                        return ("FAIL", "signer_key_id != SHA-256(SPKI of attested leaf)")
+                    if signer_key_id is not None:
+                        if not isinstance(signer_key_id, (bytes, bytearray)):
+                            return ("UNVERIFIED", "Malformed signer_key_id")
+                        if bytes(signer_key_id) != spki_sha256:
+                            return ("FAIL", "signer_key_id != SHA-256(SPKI of attested leaf)")
 
                     if kid is not None:
                         if len(kid) > len(spki_sha256) or kid != spki_sha256[: len(kid)]:
                             return ("FAIL", "COSE kid is not a prefix of SHA-256(SPKI)")
 
-                    return ("PASS", "COSE verified with attested leaf; key binding OK")
+                    return ("PASS", "COSE verified with attested leaf; key binding OK" if signer_key_id is not None else
+                                   "COSE verified with attested leaf; (photo: signer_key_id optional)")
                 except Exception as e:
                     return ("FAIL", f"COSE/attestation check failed: {e}")
 
@@ -501,8 +508,9 @@ def verify_path(path: str, *, details: bool = False, public_key_pem: Optional[by
     Full verifier:
       - extract manifest (COSE or CBOR),
       - if COSE: verify using supplied public key OR attestation leaf key (video: attestation_chain; photo: trust.cert_chain_der),
-      - enforce ES256 and key binding (signer_key_id + kid prefix),
-      - recompute chunk chain (frames/bytes) from the actual file when present (videos),
+      - enforce ES256 and key binding (signer_key_id + kid prefix) [signer_key_id optional for photos],
+      - recompute chunk chain (frames/bytes) from the actual file for videos,
+      - recompute Himg for photos (only if byteset.himg is present),
       - map tier (SILVER when attested TEE + valid COSE; for photos use trust.tier if present),
       - watermark checks are deprecated (watermark_status is fixed to 'UNVERIFIED').
     """
@@ -558,11 +566,10 @@ def verify_path(path: str, *, details: bool = False, public_key_pem: Optional[by
                 except Exception as e:
                     sig_status, sig_reason = ("FAIL", f"COSE verify with provided key failed: {e}")
             else:
-                # Attestation path does both signature + key binding checks
+                # Attestation path does both signature + key binding checks (with photo relaxation)
                 sig_status, sig_reason = _verify_cose_with_attestation(cose, payload_map)
 
-    # ---- Pin check
-    # Video-style whole-file pins we can recompute; photo-style content pin (integrity.content_sha256) is informational.
+    # ---- Pin check (whole-file SHA-256 if present)
     pin_ok: Optional[bool] = True
     pin_expected: Optional[str] = None
     photo_content_pin: Optional[str] = None
@@ -577,7 +584,7 @@ def verify_path(path: str, *, details: bool = False, public_key_pem: Optional[by
         else:
             pin_ok = None  # unknown/irrelevant (e.g., photos)
 
-    # ---- Chunk chain / Merkle (recompute from file, if present)
+    # ---- Chain / Integrity recompute
     chain_status = "UNVERIFIED"
     diag: Dict[str, Any] = {}
 
@@ -605,6 +612,7 @@ def verify_path(path: str, *, details: bool = False, public_key_pem: Optional[by
     chunk_mode = (payload_map.get("chunk_mode") or "bytes").lower() if isinstance(payload_map, dict) else "bytes"
     algo = (payload_map.get("chunk_alg") or "sha-256").lower() if isinstance(payload_map, dict) else "sha-256"
 
+    # Video path (chunks/Merkle)
     if expected_root and algo == "sha-256":
         try:
             if chunk_mode == "frames":
@@ -642,6 +650,26 @@ def verify_path(path: str, *, details: bool = False, public_key_pem: Optional[by
         except Exception as e:
             chain_status = "UNVERIFIED"
             diag["error"] = f"chunk recompute error: {e}"
+
+    # Photo path (Himg only if byteset.himg is present)
+    is_photo = isinstance(payload_map, dict) and (payload_map.get("schema") or {}).get("name") == "capture.photo"
+    if is_photo:
+        try:
+            himg = hash_jpeg_himg(path)
+            bset = (payload_map.get("byteset") or {})
+            photo_himg = bset.get("himg") or (payload_map.get("integrity") or {}).get("himg")
+            if isinstance(photo_himg, (bytes, bytearray)):
+                photo_himg = bytes(photo_himg).hex()
+            if photo_himg:
+                want = str(photo_himg).strip().lower()
+                chain_status = "PASS" if himg.lower() == want else "FAIL"
+                diag.update({"mode": "photo", "himg_recomputed": himg, "himg_expected": want})
+            else:
+                # App emits content_sha256 for encrypted-original; CLI cannot recompute it.
+                diag.update({"mode": "photo", "himg_recomputed": himg, "note": "no byteset.himg in manifest"})
+        except Exception as e:
+            chain_status = "UNVERIFIED"
+            diag["error_photo"] = f"himg recompute error: {e}"
 
     # ---- Watermark: deprecated
     wm_status = "UNVERIFIED"
