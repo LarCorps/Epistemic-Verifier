@@ -1,0 +1,11 @@
+# Design docs are internal; keep out of the open verifier repo.
+/docs/
+
+# Local environments and caches.
+/.venv/
+**/__pycache__/
+*.pyc
+
+# Local media pulls and samples.
+/media-pull-*/
+/sample_photo.jpg

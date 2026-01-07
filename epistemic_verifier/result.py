@@ -19,5 +19,6 @@ class VerifyResult:
     signature_status: str = "UNVERIFIED"  # PASS/FAIL/UNVERIFIED
     watermark_status: str = "UNVERIFIED"  # PASS/FAIL/UNVERIFIED
     attestation_status: str = "UNVERIFIED"  # PASS/FAIL/UNVERIFIED
+    aocv_status: str = "UNVERIFIED"  # PASS/FAIL/UNVERIFIED (camera sensor challenge)
     manifest: Optional[Dict[str, Any]] = None
     details: Dict[str, Any] = field(default_factory=dict)

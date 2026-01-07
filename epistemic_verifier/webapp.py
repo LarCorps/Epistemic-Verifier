@@ -83,6 +83,7 @@ def verify():
             "signature_status": _json_safe(res.signature_status),
             "watermark_status": _json_safe(res.watermark_status),
             "attestation_status": _json_safe(res.attestation_status),
+            "aocv_status": _json_safe(getattr(res, "aocv_status", "UNVERIFIED")),
             "details": _json_safe(res.details),
             "manifest": _json_safe(res.manifest),
         }
